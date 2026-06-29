@@ -1,0 +1,13 @@
+[Unit]
+Description=DX4600 Pro Hardware Monitor & Control Panel
+After=network.target ugreen-led-init.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/lixin/fnos_panel.py
+WorkingDirectory=/home/lixin
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

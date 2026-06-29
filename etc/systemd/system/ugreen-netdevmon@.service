@@ -1,0 +1,12 @@
+[Unit]
+Description=UGREEN LEDs daemon for monitoring netio (of %i) and blinking corresponding LEDs
+After=ugreen-probe-leds.service
+Requires=ugreen-probe-leds.service
+
+[Service]
+RemainAfterExit=yes
+ExecStart=/usr/bin/ugreen-netdevmon %i
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target

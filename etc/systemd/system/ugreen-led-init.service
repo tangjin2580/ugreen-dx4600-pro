@@ -1,0 +1,13 @@
+[Unit]
+Description=Load UGREEN LED driver and create I2C device
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/bin/sh -c "echo 0x3a > /sys/bus/i2c/devices/i2c-0/delete_device"
+ExecStart=/bin/sh -c "modprobe led-ugreen && sleep 0.5 && echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-0/new_device"
+ExecStop=/bin/sh -c "echo 0x3a > /sys/bus/i2c/devices/i2c-0/delete_device 2>/dev/null; modprobe -r led-ugreen 2>/dev/null"
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=UGREEN LED initial hardware probing service
+After=ugreen-led-init.service
+Requires=ugreen-led-init.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+RemainAfterExit=true
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target

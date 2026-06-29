@@ -1,0 +1,3 @@
+lixin ALL=(ALL) NOPASSWD: /bin/cp /home/ugreen_leds_controller/scripts/* /usr/bin/
+lixin ALL=(ALL) NOPASSWD: /bin/systemctl start ugreen-*, /bin/systemctl stop ugreen-*, /bin/systemctl restart ugreen-*, /bin/systemctl status ugreen-*
+lixin ALL=(ALL) NOPASSWD: /usr/bin/ugreen-*
