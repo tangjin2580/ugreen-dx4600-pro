@@ -1,0 +1,37 @@
+#!/usr/bin/bash
+# Auto-detect the I2C bus where the UGREEN LED controller (0x3a) is connected.
+# Usage: ugreen-detect-i2c
+# Output: bus number on success, exits 1 on failure.
+
+set -euo pipefail
+SLAVE_ADDR="0x3a"
+
+# 1. Find the bus where the device is currently active (shows UU in i2cdetect)
+#    This is more reliable than checking registration alone.
+for bus_path in /sys/bus/i2c/devices/i2c-*; do
+    bus="${bus_path##*/i2c-}"
+    name=$(cat "$bus_path/name" 2>/dev/null || echo "unknown")
+    case "$name" in *gmbus*|*drm*|*DP*|*HDMI*|*DDC*) continue ;; esac
+    
+    r=$(i2cdetect -y "$bus" "$SLAVE_ADDR" "$SLAVE_ADDR" 2>/dev/null || true)
+    if echo "$r" | grep -q "UU"; then
+        echo "$bus"
+        exit 0
+    fi
+done
+
+# 2. If not currently active, temporarily probe each bus to find it
+for bus_path in /sys/bus/i2c/devices/i2c-*; do
+    bus="${bus_path##*/i2c-}"
+    name=$(cat "$bus_path/name" 2>/dev/null || echo "unknown")
+    case "$name" in *gmbus*|*drm*|*DP*|*HDMI*|*DDC*) continue ;; esac
+    
+    r=$(i2cdetect -y -r "$bus" "$SLAVE_ADDR" "$SLAVE_ADDR" 2>/dev/null || true)
+    if echo "$r" | grep -q "3a"; then
+        echo "$bus"
+        exit 0
+    fi
+done
+
+echo "ERROR: LED controller at $SLAVE_ADDR not found" >&2
+exit 1

@@ -277,6 +277,134 @@ def sync_all_leds_to_config():
         return False, f"写入配置文件失败: {e}"
 
 
+# ─── LED I2C bus auto-repair ───
+def led_repair():
+    """Auto-detect correct I2C bus for LED controller and fix service config."""
+    result = {"ok": False, "message": "", "steps": []}
+    
+    # 1. Check if LEDs already exist
+    led_ok = any(os.path.isdir(f"{LED_BASE}/{n}") for n in LED_NAMES)
+    if led_ok:
+        result["ok"] = True
+        result["message"] = "LED 设备正常，无需修复"
+        return result
+    
+    # 2. Find which I2C bus has the device at 0x3a
+    svc_path = "/etc/systemd/system/ugreen-led-init.service"
+    found_bus = None
+    
+    try:
+        i2c_devs = sorted(os.listdir("/sys/bus/i2c/devices"))
+    except OSError:
+        i2c_devs = []
+    
+    for dev in i2c_devs:
+        if not dev.startswith("i2c-"):
+            continue
+        bus = dev.replace("i2c-", "")
+        try:
+            name = read_str(f"/sys/bus/i2c/devices/{dev}/name")
+        except Exception:
+            name = ""
+        # Skip non-physical buses
+        if "gmbus" in name.lower() or "drm" in name.lower():
+            continue
+        
+        result["steps"].append(f"扫描 I2C 总线 {bus} ({name})...")
+        
+        # Try to communicate with address 0x3a
+        try:
+            r = subprocess.run(
+                ["/usr/local/bin/i2cdetect", "-y", "-r", bus, "0x3a", "0x3a"],
+                capture_output=True, text=True, timeout=5
+            )
+            if "3a" in r.stdout:
+                result["steps"].append(f"  ✓ 在 i2c-{bus} 检测到设备 0x3a")
+                found_bus = bus
+                break
+        except Exception as e:
+            result["steps"].append(f"  ✗ i2c-{bus}: {e}")
+    
+    if not found_bus:
+        # Also try SMBus detection without module loaded
+        result["steps"].append("尝试卸载模块后重新扫描...")
+        subprocess.run(["modprobe", "-r", "led_ugreen"], capture_output=True, timeout=5)
+        import time
+        time.sleep(0.3)
+        
+        for dev in i2c_devs:
+            if not dev.startswith("i2c-"):
+                continue
+            bus = dev.replace("i2c-", "")
+            try:
+                name = read_str(f"/sys/bus/i2c/devices/{dev}/name")
+            except Exception:
+                name = ""
+            if "gmbus" in name.lower() or "drm" in name.lower():
+                continue
+            try:
+                r = subprocess.run(
+                    ["i2cdetect", "-y", "-r", bus, "0x3a", "0x3a"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if "3a" in r.stdout:
+                    result["steps"].append(f"  ✓ 在 i2c-{bus} 检测到设备 0x3a")
+                    found_bus = bus
+                    break
+            except Exception:
+                pass
+    
+    if not found_bus:
+        result["message"] = "未找到 LED 控制器 (0x3a)，请检查硬件连接"
+        return result
+    
+    # 3. Update service file
+    result["steps"].append(f"更新服务文件，使用 i2c-{found_bus}...")
+    try:
+        with open(svc_path) as f:
+            content = f.read()
+        
+        # Replace all occurrences of i2c-X with the found bus
+        import re
+        old_bus = re.search(r'i2c-(\d+)', content)
+        old_bus_num = old_bus.group(1) if old_bus else "0"
+        
+        if old_bus_num == found_bus:
+            result["steps"].append(f"  服务已指向 i2c-{found_bus}，无需修改")
+        else:
+            content = re.sub(r'i2c-\d+', f'i2c-{found_bus}', content)
+            with open(svc_path, "w") as f:
+                f.write(content)
+            result["steps"].append(f"  已从 i2c-{old_bus_num} 更新为 i2c-{found_bus}")
+    except OSError as e:
+        result["message"] = f"更新服务文件失败: {e}"
+        return result
+    
+    # 4. Reload systemd and restart services
+    result["steps"].append("重载 systemd 并重启服务...")
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=5)
+    subprocess.run(["modprobe", "-r", "led_ugreen"], capture_output=True, timeout=5)
+    time.sleep(0.5)
+    
+    services = ["ugreen-led-init", "ugreen-power-led", "ugreen-diskiomon", "ugreen-netdevmon@enp2s0"]
+    for svc in services:
+        r = subprocess.run(["systemctl", "restart", svc], capture_output=True, timeout=10)
+        result["steps"].append(f"  重启 {svc}: {'OK' if r.returncode == 0 else 'FAIL'}")
+    
+    time.sleep(1)
+    # 5. Verify
+    led_ok = any(os.path.isdir(f"{LED_BASE}/{n}") for n in LED_NAMES)
+    if led_ok:
+        leds = [n for n in LED_NAMES if os.path.isdir(f"{LED_BASE}/{n}")]
+        result["ok"] = True
+        result["message"] = f"修复成功! 已检测到 LED 设备: {', '.join(leds)}"
+    else:
+        result["ok"] = False
+        result["message"] = "修复后仍未检测到 LED 设备，请尝试重启系统"
+    
+    return result
+
+
 # ─── Disk serial detection ───
 def get_disk_serials():
     """Scan SATA disk devices and return serial numbers with physical slot mapping."""
@@ -372,6 +500,191 @@ def get_service_statuses():
             "sub_state": sub,
         })
     return results
+
+
+# ─── Health check ───
+def get_health_check():
+    """Comprehensive health check for all system components."""
+    issues = []
+    ok_count = 0
+    warn_count = 0
+    
+    # 1. LED devices check
+    led_list = [n for n in LED_NAMES if os.path.isdir(f"{LED_BASE}/{n}")]
+    if not led_list:
+        issues.append({
+            "severity": "error",
+            "component": "LED 设备",
+            "message": "未检测到任何 LED 设备",
+            "fix": "点击下方 🔧 修复 按钮自动检测 I2C 总线"
+        })
+    else:
+        ok_count += 1
+        missing = [n for n in LED_NAMES if n not in led_list]
+        if missing:
+            issues.append({
+                "severity": "warning",
+                "component": "LED 设备",
+                "message": f"部分 LED 不可用: {', '.join(missing)}"
+            })
+    
+    # 2. Service health
+    for svc, label in LED_SERVICES:
+        unit = svc if "." in svc else svc + ".service"
+        try:
+            r = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True, timeout=5)
+            status = r.stdout.strip()
+            if status == "active":
+                ok_count += 1
+            elif status == "failed":
+                issues.append({
+                    "severity": "error",
+                    "component": label,
+                    "message": f"服务 {svc} 状态: {status}",
+                    "fix": f"systemctl restart {unit}"
+                })
+            elif status == "inactive":
+                issues.append({
+                    "severity": "warning",
+                    "component": label,
+                    "message": f"服务 {svc} 已停止",
+                    "fix": f"systemctl start {unit}"
+                })
+        except Exception:
+            issues.append({
+                "severity": "error",
+                "component": label,
+                "message": f"无法查询服务 {svc}"
+            })
+    
+    # 3. DKMS module check
+    kernel = os.uname().release
+    dkms_ok = False
+    try:
+        r = subprocess.run(
+            ["dkms", "status", DKMS_PKG_NAME],
+            capture_output=True, text=True, timeout=5
+        )
+        if kernel in r.stdout and "installed" in r.stdout:
+            dkms_ok = True
+    except Exception:
+        pass
+    
+    if dkms_ok:
+        ok_count += 1
+    else:
+        # Check if module is at least loaded
+        try:
+            r = subprocess.run(["lsmod"], capture_output=True, text=True, timeout=5)
+            if "led_ugreen" in r.stdout:
+                ok_count += 1
+            else:
+                issues.append({
+                    "severity": "error",
+                    "component": "内核模块",
+                    "message": f"led-ugreen 模块未加载 (内核 {kernel})",
+                    "fix": "重启系统或手动运行 deploy.sh"
+                })
+        except Exception:
+            issues.append({
+                "severity": "error",
+                "component": "内核模块",
+                "message": "无法检测内核模块状态"
+            })
+    
+    # 4. I2C bus check
+    if not led_list:
+        try:
+            import re
+            i2c_devs = sorted(os.listdir("/sys/bus/i2c/devices"))
+            found = False
+            for dev in i2c_devs:
+                if not dev.startswith("i2c-"):
+                    continue
+                bus = dev.replace("i2c-", "")
+                try:
+                    name = open(f"/sys/bus/i2c/devices/{dev}/name").read().strip()
+                except Exception:
+                    name = ""
+                if "gmbus" in name.lower():
+                    continue
+                r = subprocess.run(
+                    ["/usr/local/bin/i2cdetect", "-y", "-r", bus, "0x3a", "0x3a"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if "3a" in r.stdout:
+                    found = True
+                    issues.append({
+                        "severity": "error",
+                        "component": "I2C 总线",
+                        "message": f"LED 控制器在 i2c-{bus} 但未初始化",
+                        "fix": "点击 🔧 修复 自动配置"
+                    })
+                    break
+            if not found:
+                issues.append({
+                    "severity": "error",
+                    "component": "I2C 总线",
+                    "message": "未找到 LED 控制器 (0x3a)"
+                })
+        except Exception as e:
+            issues.append({
+                "severity": "warning",
+                "component": "I2C 扫描",
+                "message": f"I2C 扫描异常: {e}"
+            })
+    
+    # 5. Disk detection
+    try:
+        r = subprocess.run(["lsblk", "-S", "-o", "name,tran", "-n"], capture_output=True, text=True, timeout=5)
+        sata_disks = [l.split()[0] for l in r.stdout.strip().split("\n") if "sata" in l]
+        if not sata_disks:
+            issues.append({
+                "severity": "warning",
+                "component": "磁盘检测",
+                "message": "未检测到 SATA 磁盘"
+            })
+        else:
+            ok_count += 1
+    except Exception:
+        pass
+    
+    # 6. Network interface
+    netdev_ok = False
+    try:
+        r = subprocess.run(["systemctl", "is-active", "ugreen-netdevmon@enp2s0"], capture_output=True, text=True, timeout=5)
+        if r.stdout.strip() == "active":
+            netdev_ok = True
+            ok_count += 1
+    except Exception:
+        pass
+    
+    if not netdev_ok:
+        # Try to find alternative
+        try:
+            import glob
+            ifaces = [os.path.basename(d) for d in glob.glob("/sys/class/net/en*") if d]
+            if ifaces:
+                issues.append({
+                    "severity": "warning",
+                    "component": "网络监控",
+                    "message": f"netdevmon 未运行，可用接口: {', '.join(ifaces[:3])}"
+                })
+        except Exception:
+            pass
+    
+    # Summary
+    all_ok = len([i for i in issues if i["severity"] == "error"]) == 0
+    
+    return {
+        "ok": all_ok,
+        "ok_count": ok_count,
+        "warn_count": warn_count,
+        "issues": issues,
+        "kernel": kernel,
+        "led_devices": led_list,
+        "dkms_ok": dkms_ok,
+    }
 
 
 def restart_service(svc_name):
@@ -592,6 +905,9 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path == "/api/leds":
             self.send_json(get_led_status())
+        elif path == "/api/health":
+            self.send_json(get_health_check())
+
         elif path == "/api/services":
             self.send_json(get_service_statuses())
         elif path == "/api/config/leds":
@@ -610,6 +926,7 @@ class Handler(BaseHTTPRequestHandler):
                 },
                 "leds": get_led_status(),
                 "services": get_service_statuses(),
+                "health": get_health_check(),
                 "dkms": get_dkms_info(),
             })
         else:
@@ -691,6 +1008,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             ok, msg = restart_service(svc)
             self.send_json({"ok": ok, "message": msg})
+
+        elif path == "/api/led/repair":
+            result = led_repair()
+            self.send_json(result)
 
         elif path == "/api/dkms/rebuild":
             success, output = dkms_rebuild()
@@ -925,7 +1246,13 @@ input[type=color]{
   height:14px;width:14px;border-radius:50%;background:#fff;border:none
 }
 .slider-wrap{flex:1;height:22px;display:flex;align-items:center;border-radius:6px;overflow:hidden;background:#1a1a1a}
-.status-bar{position:fixed;bottom:0;left:0;right:0;background:rgba(13,17,23,0.9);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-top:1px solid rgba(255,255,255,0.06);padding:8px 16px;font-size:.75em;color:var(--text2);display:flex;justify-content:space-between}
+.status-bar{position:fixed;bottom:0;left:0;right:0;background:rgba(13,17,23,0.9);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-top:1px solid rgba(255,255,255,0.06);padding:8px 16px;font-size:.75em;color:var(--text2);display:flex;justify-content:space-between;gap:12px}
+#health-indicator{cursor:pointer;display:flex;align-items:center;gap:4px}
+#health-indicator .dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+#health-indicator .dot.green{background:var(--green)}
+#health-indicator .dot.orange{background:var(--orange);box-shadow:0 0 6px var(--orange)}
+#health-indicator .dot.red{background:var(--red);box-shadow:0 0 6px var(--red);animation:blink 1s infinite}
+@keyframes blink{50%{opacity:0.4}}
 .curve-info{font-size:.75em;color:var(--text2);margin-top:10px;line-height:1.6}
 
 /* Service status */
@@ -1207,6 +1534,8 @@ input[type=color]{
       <div class="slider-wrap"><input type="range" class="glass-slider" id="all-brightness" min="0" max="255" value="128"></div>
     </div>
     <button class="btn btn-green" onclick="saveColorsToConfig()">保存到配置文件</button>
+    <button class="btn" style="border-color:var(--orange);color:var(--orange)" onclick="ledRepair()" id="btn-repair">🔧 修复</button>
+    <span id="repair-msg" style="font-size:.8em;color:var(--text2)"></span>
   </div>
 </div>
 
@@ -1254,6 +1583,7 @@ input[type=color]{
 
 <div class="status-bar">
   <span id="last-update">等待数据...</span>
+  <span id="health-indicator"></span>
   <span>DX4600 Pro · Intel N6005</span>
 </div>
 
@@ -1472,6 +1802,26 @@ function renderDkms(dkms) {
   }
 }
 
+function updateHealth(health) {
+  const el = document.getElementById('health-indicator');
+  if (!health) { el.innerHTML = ''; return; }
+  const errors = health.issues.filter(i => i.severity === 'error').length;
+  const warns = health.issues.filter(i => i.severity === 'warning').length;
+  if (errors > 0) {
+    el.innerHTML = '<span class="dot red"></span> ' + errors + ' 个错误';
+    el.title = health.issues.filter(i => i.severity === 'error').map(i => i.component + ': ' + i.message).join('\n');
+    el.style.color = 'var(--red)';
+  } else if (warns > 0) {
+    el.innerHTML = '<span class="dot orange"></span> ' + warns + ' 个警告';
+    el.title = health.issues.map(i => i.component + ': ' + i.message).join('\n');
+    el.style.color = 'var(--orange)';
+  } else {
+    el.innerHTML = '<span class="dot green"></span> 系统正常';
+    el.title = health.ok_count + ' 项检查通过';
+    el.style.color = 'var(--green)';
+  }
+}
+
 // ─── API helpers ───
 async function api(method, path, body) {
   const opts = { method, headers: { 'Content-Type': 'application/json' } };
@@ -1490,6 +1840,7 @@ async function refresh() {
     renderServices(data.services);
     renderDkms(data.dkms);
     document.getElementById('last-update').textContent = '最后更新: ' + new Date().toLocaleTimeString('zh-CN');
+    updateHealth(data.health);
     if (firstLoad) {
       firstLoad = false;
       document.getElementById('loading-overlay').classList.add('hidden');
@@ -1523,6 +1874,22 @@ async function setLedBlink(name) { await api('POST', '/api/led/set', { name, bli
 async function setAllLeds() {
   await api('POST', '/api/led/all', { color: hexToRgb(document.getElementById('all-color').value), brightness: parseInt(document.getElementById('all-brightness').value) });
   refresh();
+}
+
+async function ledRepair() {
+  const btn = document.getElementById('btn-repair');
+  const msg = document.getElementById('repair-msg');
+  btn.disabled = true; btn.textContent = '修复中...'; msg.textContent = '';
+  try {
+    const res = await api('POST', '/api/led/repair');
+    msg.textContent = res.message;
+    msg.style.color = res.ok ? 'var(--green)' : 'var(--red)';
+    if (res.ok) refresh();
+  } catch(e) {
+    msg.textContent = '修复请求失败: ' + e.message;
+    msg.style.color = 'var(--red)';
+  }
+  btn.disabled = false; btn.textContent = '🔧 修复';
 }
 
 async function saveColorsToConfig() {

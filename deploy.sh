@@ -86,7 +86,7 @@ cp -f "${SCRIPT_DIR}/etc/sudoers.d/lixin-ugreen" /etc/sudoers.d/lixin-ugreen
 chmod 440 /etc/sudoers.d/lixin-ugreen
 log "  /etc/sudoers.d/lixin-ugreen"
 
-# ─── 6. Systemd 服务 ───
+# ─── 10. Systemd 服务 ───
 log "安装 systemd 服务..."
 SERVICES=(
     fnos-panel.service
@@ -102,20 +102,32 @@ for svc in "${SERVICES[@]}"; do
 done
 systemctl daemon-reload
 
-# ─── 7. Web 面板 ───
+# ─── 7. I2C 自动检测 ───
+log "安装 I2C 检测脚本..."
+cp -f "${SCRIPT_DIR}/usr/bin/ugreen-detect-i2c" "/usr/bin/ugreen-detect-i2c"
+chmod +x "/usr/bin/ugreen-detect-i2c"
+
+# ─── 8. Web 面板 ───
 log "安装 Web 面板..."
 cp -f "${SCRIPT_DIR}/fnos_panel.py" "${TARGET_HOME}/fnos_panel.py"
 chown "${TARGET_USER}:${TARGET_USER}" "${TARGET_HOME}/fnos_panel.py"
 
-# ─── 8. 启动服务 ───
+# ─── 9. 启动服务 ───
 log "启动服务..."
 
-# 加载内核模块 + 创建 I2C 设备
-modprobe led-ugreen 2>/dev/null || true
-sleep 0.5
-echo 0x3a > /sys/bus/i2c/devices/i2c-0/delete_device 2>/dev/null || true
-sleep 0.2
-echo "led-ugreen 0x3a" > /sys/bus/i2c/devices/i2c-0/new_device 2>/dev/null || true
+# 自动检测 I2C 总线并创建设备
+I2C_BUS=$(/usr/bin/ugreen-detect-i2c 2>/dev/null || echo "")
+if [ -n "$I2C_BUS" ]; then
+    log "LED 控制器在 I2C 总线: $I2C_BUS"
+    # 清理旧设备
+    echo 0x3a > /sys/bus/i2c/devices/i2c-${I2C_BUS}/delete_device 2>/dev/null || true
+    sleep 0.2
+    modprobe led-ugreen 2>/dev/null || true
+    sleep 0.5
+    echo "led-ugreen 0x3a" > /sys/bus/i2c/devices/i2c-${I2C_BUS}/new_device 2>/dev/null || true
+else
+    warn "未检测到 LED 控制器，跳过 I2C 初始化"
+fi
 
 # 启动服务链
 systemctl enable --now ugreen-led-init.service
