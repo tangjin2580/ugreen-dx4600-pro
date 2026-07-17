@@ -18,6 +18,27 @@ HOST = "0.0.0.0"
 PORT = 9092
 REFRESH_INTERVAL = 3  # seconds between temp checks in auto mode
 
+# ─── Cache ───
+_cache = {}
+_cache_ttl = {
+    "temps": 2,
+    "fans": 2,
+    "leds": 5,
+    "services": 10,
+    "health": 15,
+    "dkms": 60,
+}
+
+def cached(key, fn, *args):
+    """Return cached result if within TTL, else recalculate."""
+    now = time.time()
+    entry = _cache.get(key)
+    if entry and (now - entry["ts"]) < _cache_ttl.get(key, 5):
+        return entry["data"]
+    data = fn(*args)
+    _cache[key] = {"ts": now, "data": data}
+    return data
+
 # ─── Hardware paths ───
 HWMON_CORETEMP = "/sys/class/hwmon/hwmon2"
 HWMON_NVME = "/sys/class/hwmon/hwmon1"
@@ -475,30 +496,37 @@ def get_disk_serials():
 
 # ─── Service status ───
 def get_service_statuses():
-    """Query systemd for LED-related service statuses."""
+    """Query systemd for LED-related service statuses — batched into one call."""
+    units = [svc if "." in svc else svc + ".service" for svc, _ in LED_SERVICES]
     results = []
-    for svc_name, label in LED_SERVICES:
-        unit = svc_name if "." in svc_name else svc_name + ".service"
-        try:
-            active = subprocess.run(
-                ["systemctl", "is-active", unit],
-                capture_output=True, text=True, timeout=5
-            )
-            load = subprocess.run(
-                ["systemctl", "show", unit, "--property=SubState", "--value"],
-                capture_output=True, text=True, timeout=5
-            )
-            status = active.stdout.strip()
-            sub = load.stdout.strip()
-        except Exception:
-            status = "unknown"
-            sub = "unknown"
-        results.append({
-            "name": svc_name,
-            "label": label,
-            "status": status,
-            "sub_state": sub,
-        })
+    try:
+        r = subprocess.run(
+            ["systemctl", "show", *units, 
+             "--property=Id,ActiveState,SubState", "--value", "-p"],
+            capture_output=True, text=True, timeout=10
+        )
+        lines = r.stdout.strip().split("\n")
+        statuses = {}
+        i = 0
+        while i < len(lines):
+            name = lines[i].strip()
+            active = lines[i+1].strip() if i+1 < len(lines) else "unknown"
+            sub = lines[i+2].strip() if i+2 < len(lines) else "unknown"
+            statuses[name] = (active, sub)
+            i += 3
+        for svc_name, label in LED_SERVICES:
+            unit = svc_name if "." in svc_name else svc_name + ".service"
+            active, sub = statuses.get(unit, ("unknown", "unknown"))
+            results.append({
+                "name": svc_name, "label": label,
+                "status": active, "sub_state": sub,
+            })
+    except Exception:
+        for svc_name, label in LED_SERVICES:
+            results.append({
+                "name": svc_name, "label": label,
+                "status": "unknown", "sub_state": "unknown",
+            })
     return results
 
 
@@ -895,39 +923,55 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             self.send_html()
         elif path == "/api/temps":
-            self.send_json(get_temps())
+            self.send_json(cached("temps", get_temps))
         elif path == "/api/fans":
             self.send_json({
                 "mode": fan_mode,
                 "manual_count": fan_manual_count,
-                "fans": get_fan_status(),
+                "fans": cached("fans", get_fan_status),
                 "cpu_temp": get_cpu_package_temp(),
             })
         elif path == "/api/leds":
-            self.send_json(get_led_status())
+            self.send_json(cached("leds", get_led_status))
         elif path == "/api/health":
-            self.send_json(get_health_check())
+            self.send_json(cached("health", get_health_check))
 
         elif path == "/api/services":
-            self.send_json(get_service_statuses())
+            self.send_json(cached("services", get_service_statuses))
         elif path == "/api/config/leds":
             self.send_json({"content": get_leds_config()})
         elif path == "/api/dkms":
-            self.send_json(get_dkms_info())
+            self.send_json(cached("dkms", get_dkms_info))
         elif path == "/api/disk-serials":
             self.send_json(get_disk_serials())
-        elif path == "/api/all":
+        elif path == "/api/realtime":
             self.send_json({
-                "temps": get_temps(),
+                "temps": cached("temps", get_temps),
                 "fans": {
                     "mode": fan_mode,
                     "manual_count": fan_manual_count,
-                    "fans": get_fan_status(),
+                    "fans": cached("fans", get_fan_status),
                 },
-                "leds": get_led_status(),
-                "services": get_service_statuses(),
-                "health": get_health_check(),
-                "dkms": get_dkms_info(),
+            })
+        elif path == "/api/status":
+            self.send_json({
+                "leds": cached("leds", get_led_status),
+                "services": cached("services", get_service_statuses),
+                "dkms": cached("dkms", get_dkms_info),
+                "health": cached("health", get_health_check),
+            })
+        elif path == "/api/all":
+            self.send_json({
+                "temps": cached("temps", get_temps),
+                "fans": {
+                    "mode": fan_mode,
+                    "manual_count": fan_manual_count,
+                    "fans": cached("fans", get_fan_status),
+                },
+                "leds": cached("leds", get_led_status),
+                "services": cached("services", get_service_statuses),
+                "health": cached("health", get_health_check),
+                "dkms": cached("dkms", get_dkms_info),
             })
         else:
             self.send_error(404)
@@ -1833,21 +1877,28 @@ async function api(method, path, body) {
 let firstLoad = true;
 async function refresh() {
   try {
-    const data = await api('GET', '/api/all');
+    const data = await api('GET', '/api/realtime');
     renderTemps(data.temps);
     renderFans(data.fans);
-    if (!colorPickerOpen) renderLeds(data.leds);
-    renderServices(data.services);
-    renderDkms(data.dkms);
     document.getElementById('last-update').textContent = '最后更新: ' + new Date().toLocaleTimeString('zh-CN');
-    updateHealth(data.health);
     if (firstLoad) {
       firstLoad = false;
       document.getElementById('loading-overlay').classList.add('hidden');
+      refreshAll(); // load everything on first visit
     }
   } catch(e) {
     document.getElementById('last-update').textContent = '连接失败: ' + e.message;
   }
+}
+
+async function refreshAll() {
+  try {
+    const data = await api('GET', '/api/all');
+    if (!colorPickerOpen) renderLeds(data.leds);
+    renderServices(data.services);
+    renderDkms(data.dkms);
+    updateHealth(data.health);
+  } catch(e) { console.log('Status refresh error:', e); }
 }
 
 // ─── Fan controls ───
@@ -1884,7 +1935,7 @@ async function ledRepair() {
     const res = await api('POST', '/api/led/repair');
     msg.textContent = res.message;
     msg.style.color = res.ok ? 'var(--green)' : 'var(--red)';
-    if (res.ok) refresh();
+    if (res.ok) refreshAll();
   } catch(e) {
     msg.textContent = '修复请求失败: ' + e.message;
     msg.style.color = 'var(--red)';
@@ -2082,6 +2133,7 @@ async function doRebuild() {
 refresh();
 loadConfig();
 pollTimer = setInterval(refresh, 3000);
+setInterval(refreshAll, 30000);
 updateClock();
 setInterval(updateClock, 1000);
 fetchWeather();
