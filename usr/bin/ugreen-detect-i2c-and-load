@@ -1,0 +1,10 @@
+#!/bin/bash
+I2C=$(/usr/bin/ugreen-detect-i2c) || { echo "I2C detect failed" >&2; exit 1; }
+echo "LED controller on i2c-${I2C}"
+if [ -d "/sys/bus/i2c/devices/${I2C}-003a" ]; then
+    echo "Device already exists on i2c-${I2C}"
+    exit 0
+fi
+/usr/sbin/modprobe led-ugreen 2>/dev/null || true
+sleep 0.5
+echo led-ugreen 0x3a > "/sys/bus/i2c/devices/i2c-${I2C}/new_device"

@@ -349,7 +349,7 @@ def led_repair():
     if not found_bus:
         # Also try SMBus detection without module loaded
         result["steps"].append("尝试卸载模块后重新扫描...")
-        subprocess.run(["modprobe", "-r", "led_ugreen"], capture_output=True, timeout=5)
+        subprocess.run(["/usr/sbin/modprobe", "-r", "led_ugreen"], capture_output=True, timeout=5)
         import time
         time.sleep(0.3)
         
@@ -404,7 +404,7 @@ def led_repair():
     # 4. Reload systemd and restart services
     result["steps"].append("重载 systemd 并重启服务...")
     subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=5)
-    subprocess.run(["modprobe", "-r", "led_ugreen"], capture_output=True, timeout=5)
+    subprocess.run(["/usr/sbin/modprobe", "-r", "led_ugreen"], capture_output=True, timeout=5)
     time.sleep(0.5)
     
     services = ["ugreen-led-init", "ugreen-power-led", "ugreen-diskiomon", "ugreen-netdevmon@enp2s0"]
@@ -502,16 +502,16 @@ def get_service_statuses():
     try:
         r = subprocess.run(
             ["systemctl", "show", *units, 
-             "--property=Id,ActiveState,SubState", "--value", "-p"],
+             "--property=Id,ActiveState,SubState", "--value"],
             capture_output=True, text=True, timeout=10
         )
-        lines = r.stdout.strip().split("\n")
+        lines = [l for l in r.stdout.split("\n") if l.strip()]
         statuses = {}
         i = 0
-        while i < len(lines):
+        while i + 2 < len(lines):
             name = lines[i].strip()
-            active = lines[i+1].strip() if i+1 < len(lines) else "unknown"
-            sub = lines[i+2].strip() if i+2 < len(lines) else "unknown"
+            active = lines[i+1].strip()
+            sub = lines[i+2].strip()
             statuses[name] = (active, sub)
             i += 3
         for svc_name, label in LED_SERVICES:

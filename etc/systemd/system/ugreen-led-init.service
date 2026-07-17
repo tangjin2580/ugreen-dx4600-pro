@@ -5,16 +5,8 @@ After=local-fs.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c '\
-  BUS=$(/usr/bin/ugreen-detect-i2c) && \
-  echo "Found LED controller on i2c-${BUS}" && \
-  modprobe led-ugreen && \
-  sleep 0.5 && \
-  echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-${BUS}/new_device'
-ExecStop=/bin/sh -c '\
-  BUS=$(/usr/bin/ugreen-detect-i2c 2>/dev/null || echo "0") && \
-  echo 0x3a > /sys/bus/i2c/devices/i2c-${BUS}/delete_device 2>/dev/null; \
-  modprobe -r led-ugreen 2>/dev/null; true'
+ExecStart=/bin/sh -c 'BUS=$(/usr/bin/ugreen-detect-i2c); modprobe led-ugreen 2>/dev/null; sleep 0.5; echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-${BUS}/new_device 2>/dev/null; true'
+ExecStop=-/usr/sbin/modprobe -r led-ugreen
 
 [Install]
 WantedBy=multi-user.target
