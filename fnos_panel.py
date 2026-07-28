@@ -307,9 +307,10 @@ UGREEN_DETECT_I2C_SCRIPT = r'''#!/bin/bash
 # controller being visible on multiple adapters (DesignWare + SMBus I801).
 SLAVE_ADDR=3a
 
-# Fast path: an existing device node. Prefer the SMBus I801 adapter, which is
-# the bus that actually drives the LED class devices on fnOS.
-best=""
+# Fast path: ONLY trust an existing node on the SMBus I801 adapter. That is the
+# bus that actually drives the LED class devices. A DesignWare (SoC) bus may
+# expose a PHANTOM 0x3a with no LED class devices, so we must not fall back to
+# it here — instead drop through to an active scan below.
 for d in /sys/bus/i2c/devices/*-003a; do
     [ -e "$d" ] || continue
     b="${d##*/}"; b="${b%-003a}"; b="${b#i2c-}"
@@ -317,9 +318,7 @@ for d in /sys/bus/i2c/devices/*-003a; do
     if echo "$bn" | grep -qi "SMBus I801"; then
         echo "$b"; exit 0
     fi
-    [ -z "$best" ] && best="$b"
 done
-[ -n "$best" ] && { echo "$best"; exit 0; }
 
 # Locate i2cdetect (install path has varied across fnOS images)
 I2CDETECT=""
@@ -334,7 +333,7 @@ fallback=""
 for p in /sys/bus/i2c/devices/i2c-*; do
     b="${p##*/i2c-}"
     n=$(cat "$p/name" 2>/dev/null || echo x)
-    case $n in *gmbus*|*drm*|*DP*|*HDMI*|*DDC*) continue ;; esac
+    case $n in *gmbus*|*drm*|*DP*|*HDMI*|*DDC*|*designware*|*synopsys*) continue ;; esac
     r=$("$I2CDETECT" -y -r "$b" "$SLAVE_ADDR" "$SLAVE_ADDR" 2>/dev/null) || true
     if echo "$r" | grep -qiE "($SLAVE_ADDR|UU)"; then
         if echo "$n" | grep -qi "SMBus I801"; then
@@ -349,13 +348,66 @@ done
 exit 1
 '''
 
+# Robust wrapper that also ensures the DKMS module is built/installed for the
+# running kernel. Kept in sync with /usr/bin/ugreen-detect-i2c-and-load.
+UGREEN_DETECT_I2C_AND_LOAD_SCRIPT = r'''#!/bin/bash
+# Detect UGREEN LED controller bus and ensure driver + device node are loaded.
+# Belt-and-suspenders fallback used by the web one-click repair.
+K=$(uname -r)
+
+# Ensure the module is available/built for this kernel
+if ! /usr/sbin/modprobe -n led-ugreen >/dev/null 2>&1; then
+    /usr/sbin/dkms add led-ugreen/0.3 >/dev/null 2>&1 || true
+    /usr/sbin/dkms install led-ugreen/0.3 -k "$K" >/dev/null 2>&1 || true
+fi
+
+I2C=$(/usr/bin/ugreen-detect-i2c) || exit 1
+echo "LED controller on i2c-${I2C}"
+
+if [ -d "/sys/bus/i2c/devices/${I2C}-003a" ]; then
+    echo "Device already exists on i2c-${I2C}"
+    exit 0
+fi
+
+/usr/sbin/modprobe led-ugreen 2>/dev/null || true
+sleep 0.5
+echo led-ugreen 0x3a > "/sys/bus/i2c/devices/i2c-${I2C}/new_device"
+'''
+
+# Hardened led-init service with DKMS auto-install fallback. Kept in sync with
+# /etc/systemd/system/ugreen-led-init.service.
+UGREEN_LED_INIT_SERVICE = r'''[Unit]
+Description=Load UGREEN LED driver and create I2C device
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'K=$(uname -r); if ! /usr/sbin/modprobe -n led-ugreen >/dev/null 2>&1; then /usr/sbin/dkms add led-ugreen/0.3 >/dev/null 2>&1 || true; /usr/sbin/dkms install led-ugreen/0.3 -k "$K" >/dev/null 2>&1 || true; fi; BUS=$(/usr/bin/ugreen-detect-i2c); if [ -z "$BUS" ]; then echo "LED controller not found on any I2C bus" >&2; exit 1; fi; /usr/sbin/modprobe led-ugreen 2>/dev/null || true; sleep 0.5; echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-${BUS}/new_device 2>/dev/null || true; true'
+ExecStop=-/usr/sbin/modprobe -r led-ugreen
+
+[Install]
+WantedBy=multi-user.target
+'''
+
 
 def detect_led_bus():
-    """Return the I2C bus number hosting the UGREEN LED controller (0x3a), else None."""
+    """Return the I2C bus number hosting the UGREEN LED controller (0x3a), else None.
+    Prefers the SMBus I801 adapter — that is the bus that actually drives the LED
+    class devices on fnOS. A DesignWare bus may expose a phantom 0x3a with no LEDs."""
     try:
         devs = sorted(os.listdir("/sys/bus/i2c/devices"))
     except OSError:
         return None
+    i2cdetect = None
+    for c in ("/usr/local/bin/i2cdetect", "/usr/sbin/i2cdetect", "/usr/bin/i2cdetect"):
+        if os.path.exists(c):
+            i2cdetect = c
+            break
+    if i2cdetect is None:
+        return None
+    preferred = None
+    fallback = None
     for dev in devs:
         if not dev.startswith("i2c-"):
             continue
@@ -364,144 +416,167 @@ def detect_led_bus():
             name = read_str(f"/sys/bus/i2c/devices/{dev}/name")
         except Exception:
             name = ""
-        if any(k in name.lower() for k in ("gmbus", "drm", "dp", "hdmi", "ddc")):
+        if any(k in name.lower() for k in ("gmbus", "drm", "dp", "hdmi", "ddc", "designware", "synopsys")):
             continue
         try:
             r = subprocess.run(
-                ["/usr/local/bin/i2cdetect", "-y", "-r", bus, "0x3a", "0x3a"],
+                [i2cdetect, "-y", "-r", bus, "0x3a", "0x3a"],
                 capture_output=True, text=True, timeout=5,
             )
             if "3a" in r.stdout or "UU" in r.stdout:
-                return bus
+                if "smbus i801" in name.lower() and preferred is None:
+                    preferred = bus
+                elif fallback is None:
+                    fallback = bus
         except Exception:
             pass
-    return None
+    return preferred or fallback
 
 
 def led_repair():
-    """Auto-detect correct I2C bus for LED controller and fix service config."""
+    """Web one-click repair: self-heal the LED driver against fnOS upgrades.
+
+    The full fix logic lives here so a single button click can recover from the
+    two recurring failure modes:
+      1. fnOS update renumbered the I2C bus   -> robust SMBus-I801-preferred detection
+      2. fnOS update reverted our system files -> re-deploy them from embedded copies
+    Plus a DKMS auto-install fallback for newly-installed kernels.
+    """
+    import time
     result = {"ok": False, "message": "", "steps": []}
-    
-    # 1. Check if LEDs already exist
-    led_ok = any(os.path.isdir(f"{LED_BASE}/{n}") for n in LED_NAMES)
-    if led_ok:
-        result["ok"] = True
-        result["message"] = "LED 设备正常，无需修复"
-        return result
-    
-    # 2. Find which I2C bus has the device at 0x3a
-    svc_path = "/etc/systemd/system/ugreen-led-init.service"
-    found_bus = None
-    
-    try:
-        i2c_devs = sorted(os.listdir("/sys/bus/i2c/devices"))
-    except OSError:
-        i2c_devs = []
-    
-    for dev in i2c_devs:
-        if not dev.startswith("i2c-"):
-            continue
-        bus = dev.replace("i2c-", "")
-        try:
-            name = read_str(f"/sys/bus/i2c/devices/{dev}/name")
-        except Exception:
-            name = ""
-        # Skip non-physical buses
-        if "gmbus" in name.lower() or "drm" in name.lower():
-            continue
-        
-        result["steps"].append(f"扫描 I2C 总线 {bus} ({name})...")
-        
-        # Try to communicate with address 0x3a
-        try:
-            r = subprocess.run(
-                ["/usr/local/bin/i2cdetect", "-y", "-r", bus, "0x3a", "0x3a"],
-                capture_output=True, text=True, timeout=5
-            )
-            if "3a" in r.stdout:
-                result["steps"].append(f"  ✓ 在 i2c-{bus} 检测到设备 0x3a")
-                found_bus = bus
-                break
-        except Exception as e:
-            result["steps"].append(f"  ✗ i2c-{bus}: {e}")
-    
-    if not found_bus:
-        # Also try SMBus detection without module loaded
-        result["steps"].append("尝试卸载模块后重新扫描...")
-        subprocess.run(["/usr/sbin/modprobe", "-r", "led_ugreen"], capture_output=True, timeout=5)
-        import time
-        time.sleep(0.3)
-        
-        for dev in i2c_devs:
-            if not dev.startswith("i2c-"):
-                continue
-            bus = dev.replace("i2c-", "")
-            try:
-                name = read_str(f"/sys/bus/i2c/devices/{dev}/name")
-            except Exception:
-                name = ""
-            if "gmbus" in name.lower() or "drm" in name.lower():
-                continue
-            try:
-                r = subprocess.run(
-                    ["i2cdetect", "-y", "-r", bus, "0x3a", "0x3a"],
-                    capture_output=True, text=True, timeout=5
-                )
-                if "3a" in r.stdout:
-                    result["steps"].append(f"  ✓ 在 i2c-{bus} 检测到设备 0x3a")
-                    found_bus = bus
-                    break
-            except Exception:
-                pass
-    
-    if not found_bus:
-        result["message"] = "未找到 LED 控制器 (0x3a)，请检查硬件连接"
-        return result
-    
-    # 3. Persist the robust detect script so future reboots survive bus renumbering
-    result["steps"].append("写入健壮的 I2C 检测脚本 (/usr/bin/ugreen-detect-i2c)...")
-    try:
-        with open("/usr/bin/ugreen-detect-i2c", "w") as f:
-            f.write(UGREEN_DETECT_I2C_SCRIPT)
-        os.chmod("/usr/bin/ugreen-detect-i2c", 0o755)
-        result["steps"].append("  ✓ 检测脚本已更新")
-    except OSError as e:
-        result["steps"].append(f"  ✗ 写入检测脚本失败: {e}")
 
-    # 4. Directly load module + create the device on the detected bus (immediate fix)
-    result["steps"].append(f"在 i2c-{found_bus} 上加载驱动并创建 LED 设备...")
-    subprocess.run(["/usr/sbin/modprobe", "led-ugreen"], capture_output=True, timeout=10)
-    time.sleep(0.5)
-    try:
-        with open(f"/sys/bus/i2c/devices/i2c-{found_bus}/new_device", "w") as f:
-            f.write("led-ugreen 0x3a")
-        result["steps"].append("  ✓ LED 设备节点已创建")
-    except OSError as e:
-        result["steps"].append(f"  (设备节点可能已存在: {e})")
+    # Snapshot state so we can tell "already healthy" from "recovered".
+    was_ok = any(os.path.isdir(f"{LED_BASE}/{n}") for n in LED_NAMES)
 
-    # 5. Reload systemd and restart monitoring services
-    result["steps"].append("重载 systemd 并重启服务...")
+    # 1. Always re-deploy robust system files first (idempotent self-heal).
+    result["steps"].append("① 固化健壮修复文件 (抵抗 fnOS 更新回退)...")
+    _deploy_robust_files(result)
+
+    # 2. Make sure the DKMS module is built/installed for this kernel.
+    _ensure_dkms(result)
+
+    # 3. Detect the I2C bus hosting the LED controller (prefers SMBus I801).
+    bus = _robust_detect_bus(result)
+    if bus is None:
+        result["message"] = "未找到 LED 控制器 (0x3a)。请确认硬件连接，或重启系统后再点一次修复。"
+        return result
+
+    # 4. Overload systemd (service file may have changed) and (re)create the node.
+    result["steps"].append("② 重载 systemd 并重建 LED 设备节点...")
     subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=5)
-    subprocess.run(["/usr/sbin/modprobe", "-r", "led_ugreen"], capture_output=True, timeout=5)
-    time.sleep(0.5)
 
-    services = ["ugreen-led-init", "ugreen-power-led", "ugreen-diskiomon", "ugreen-netdevmon@enp2s0"]
-    for svc in services:
-        r = subprocess.run(["systemctl", "restart", svc], capture_output=True, timeout=10)
-        result["steps"].append(f"  重启 {svc}: {'OK' if r.returncode == 0 else 'FAIL'}")
+    led_ok = any(os.path.isdir(f"{LED_BASE}/{n}") for n in LED_NAMES)
+    if not led_ok:
+        _create_device(bus, result)
+        time.sleep(1)
+        led_ok = any(os.path.isdir(f"{LED_BASE}/{n}") for n in LED_NAMES)
 
+    # 5. Restart LED services (led-init recreates the node via the robust script).
+    result["steps"].append("③ 重启 LED 相关服务...")
+    _restart_led_services(result)
     time.sleep(1)
+
     # 6. Verify
     led_ok = any(os.path.isdir(f"{LED_BASE}/{n}") for n in LED_NAMES)
     if led_ok:
         leds = [n for n in LED_NAMES if os.path.isdir(f"{LED_BASE}/{n}")]
-        result["ok"] = True
-        result["message"] = f"修复成功! 已检测到 LED 设备: {', '.join(leds)}"
+        if was_ok:
+            result["ok"] = True
+            result["message"] = ("系统本就正常，已重新固化健壮修复文件；"
+                                  "后续 fnOS 升级后点此按钮即可一键自愈。")
+        else:
+            result["ok"] = True
+            result["message"] = f"修复成功! 已在 i2c-{bus} 恢复 LED 设备: {', '.join(leds)}"
     else:
         result["ok"] = False
-        result["message"] = "修复后仍未检测到 LED 设备，请尝试重启系统"
+        result["message"] = "修复后仍未检测到 LED 设备，请尝试重启系统后再点一次修复。"
 
     return result
+
+
+def _deploy_robust_files(result):
+    """Re-write the embedded robust files to their system locations.
+
+    fnOS updates have been observed to revert these; re-deploying from the panel
+    makes the web button a true self-heal without needing a manual deploy."""
+    files = [
+        ("/usr/bin/ugreen-detect-i2c", UGREEN_DETECT_I2C_SCRIPT, 0o755),
+        ("/usr/bin/ugreen-detect-i2c-and-load", UGREEN_DETECT_I2C_AND_LOAD_SCRIPT, 0o755),
+        ("/etc/systemd/system/ugreen-led-init.service", UGREEN_LED_INIT_SERVICE, 0o644),
+    ]
+    for path, content, mode in files:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(content)
+            os.chmod(path, mode)
+            result["steps"].append(f"  ✓ 已固化 {path}")
+        except OSError as e:
+            result["steps"].append(f"  ✗ 写入 {path} 失败: {e}")
+
+
+def _ensure_dkms(result):
+    """Ensure the led-ugreen DKMS module is loadable for the running kernel."""
+    r = subprocess.run(["/usr/sbin/modprobe", "-n", "led-ugreen"],
+                       capture_output=True, text=True, timeout=10)
+    if r.returncode == 0:
+        result["steps"].append("  ✓ DKMS 模块已就绪，无需编译")
+        return
+    result["steps"].append("  ⚙ DKMS 模块缺失，自动为新内核编译安装...")
+    kr = subprocess.run(["uname", "-r"], capture_output=True, text=True).stdout.strip()
+    a = subprocess.run(["/usr/sbin/dkms", "add", "led-ugreen/0.3"],
+                       capture_output=True, text=True, timeout=30)
+    if a.returncode != 0:
+        result["steps"].append(f"  (dkms add 返回 {a.returncode}, 可能已添加过)")
+    i = subprocess.run(["/usr/sbin/dkms", "install", "led-ugreen/0.3", "-k", kr],
+                       capture_output=True, text=True, timeout=180)
+    result["steps"].append(f"  dkms install: {'OK' if i.returncode == 0 else 'FAIL'}")
+
+
+def _robust_detect_bus(result):
+    """Detect the LED bus: prefer the freshly-deployed robust script, fall back to Python."""
+    try:
+        r = subprocess.run(["/usr/bin/ugreen-detect-i2c"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            bus = r.stdout.strip().splitlines()[0].strip()
+            result["steps"].append(f"  检测脚本定位到 LED 总线 i2c-{bus}")
+            return bus
+    except Exception:
+        pass
+    bus = detect_led_bus()
+    if bus:
+        result["steps"].append(f"  Python 回退检测定位到 i2c-{bus}")
+    else:
+        result["steps"].append("  ✗ 未能在任何 I2C 总线上找到 0x3a")
+    return bus
+
+
+def _create_device(bus, result):
+    """Load the module and create the I2C device node on the given bus."""
+    subprocess.run(["/usr/sbin/modprobe", "led-ugreen"], capture_output=True, timeout=10)
+    try:
+        with open(f"/sys/bus/i2c/devices/i2c-{bus}/new_device", "w") as f:
+            f.write("led-ugreen 0x3a")
+        result["steps"].append(f"  ✓ 已在 i2c-{bus} 创建 LED 设备节点")
+    except OSError as e:
+        result["steps"].append(f"  (设备节点可能已存在: {e})")
+
+
+def _restart_led_services(result):
+    """Restart all LED services; include probe-leds if the unit exists."""
+    svcs = ["ugreen-led-init", "ugreen-power-led",
+            "ugreen-diskiomon", "ugreen-netdevmon@enp2s0"]
+    try:
+        p = subprocess.run(["systemctl", "list-unit-files", "ugreen-probe-leds.service"],
+                           capture_output=True, text=True, timeout=5)
+        if "ugreen-probe-leds.service" in p.stdout:
+            svcs.insert(1, "ugreen-probe-leds")
+    except Exception:
+        pass
+    for svc in svcs:
+        r = subprocess.run(["systemctl", "restart", svc], capture_output=True, timeout=10)
+        result["steps"].append(f"  重启 {svc}: {'OK' if r.returncode == 0 else 'FAIL'}")
 
 
 # ─── Disk serial detection ───
@@ -1661,6 +1736,7 @@ input[type=color]{
     <button class="btn btn-green" onclick="saveColorsToConfig()">保存到配置文件</button>
     <button class="btn" style="border-color:var(--orange);color:var(--orange)" onclick="ledRepair()" id="btn-repair">🔧 修复</button>
     <span id="repair-msg" style="font-size:.8em;color:var(--text2)"></span>
+    <pre id="repair-steps" style="display:none;margin:8px 0 0;padding:8px 10px;background:rgba(0,0,0,.25);border-radius:8px;font-size:.72em;line-height:1.5;white-space:pre-wrap;color:var(--text2);max-height:240px;overflow:auto"></pre>
   </div>
 </div>
 
@@ -2016,6 +2092,13 @@ async function ledRepair() {
     const res = await api('POST', '/api/led/repair');
     msg.textContent = res.message;
     msg.style.color = res.ok ? 'var(--green)' : 'var(--red)';
+    const steps = document.getElementById('repair-steps');
+    if (res.steps && res.steps.length) {
+      steps.style.display = 'block';
+      steps.textContent = res.steps.join('\n');
+    } else {
+      steps.style.display = 'none';
+    }
     if (res.ok) refreshAll();
   } catch(e) {
     msg.textContent = '修复请求失败: ' + e.message;

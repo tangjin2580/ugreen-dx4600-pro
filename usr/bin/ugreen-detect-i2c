@@ -4,9 +4,10 @@
 # controller being visible on multiple adapters (DesignWare + SMBus I801).
 SLAVE_ADDR=3a
 
-# Fast path: an existing device node. Prefer the SMBus I801 adapter, which is
-# the bus that actually drives the LED class devices on fnOS.
-best=""
+# Fast path: ONLY trust an existing node on the SMBus I801 adapter. That is the
+# bus that actually drives the LED class devices. A DesignWare (SoC) bus may
+# expose a PHANTOM 0x3a with no LED class devices, so we must not fall back to
+# it here — instead drop through to an active scan below.
 for d in /sys/bus/i2c/devices/*-003a; do
     [ -e "$d" ] || continue
     b="${d##*/}"; b="${b%-003a}"; b="${b#i2c-}"
@@ -14,9 +15,7 @@ for d in /sys/bus/i2c/devices/*-003a; do
     if echo "$bn" | grep -qi "SMBus I801"; then
         echo "$b"; exit 0
     fi
-    [ -z "$best" ] && best="$b"
 done
-[ -n "$best" ] && { echo "$best"; exit 0; }
 
 # Locate i2cdetect (install path has varied across fnOS images)
 I2CDETECT=""
@@ -25,14 +24,14 @@ for c in /usr/local/bin/i2cdetect /usr/sbin/i2cdetect /usr/bin/i2cdetect; do
 done
 [ -z "$I2CDETECT" ] && exit 1
 
-# Scan every I2C bus. Prefer SMBus I801; fall back to any non-GPU bus.
+# Scan every I2C bus. Prefer SMBus I801; fall back to any non-GPU/non-SoC bus.
 preferred=""
 fallback=""
 for p in /sys/bus/i2c/devices/i2c-*; do
     b="${p##*/i2c-}"
     n=$(cat "$p/name" 2>/dev/null || echo x)
-    # Skip GPU / display buses - never the LED controller
-    case $n in *gmbus*|*drm*|*DP*|*HDMI*|*DDC*) continue ;; esac
+    # Skip GPU / display / SoC-designware buses - never the LED controller
+    case $n in *gmbus*|*drm*|*DP*|*HDMI*|*DDC*|*designware*|*synopsys*) continue ;; esac
     r=$("$I2CDETECT" -y -r "$b" "$SLAVE_ADDR" "$SLAVE_ADDR" 2>/dev/null) || true
     if echo "$r" | grep -qiE "($SLAVE_ADDR|UU)"; then
         if echo "$n" | grep -qi "SMBus I801"; then
