@@ -11,7 +11,7 @@ import glob
 import time
 import threading
 import subprocess
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 HOST = "0.0.0.0"
@@ -296,12 +296,21 @@ def set_led(name, **kwargs):
     if not os.path.isdir(base):
         return False
     if "brightness" in kwargs:
-        write_int(f"{base}/brightness", kwargs["brightness"])
+        # Clamp to valid LED sysfs range (0..max_brightness, typically 0..255)
+        b = int(kwargs["brightness"])
+        max_b = read_int(f"{base}/max_brightness") or 255
+        b = max(0, min(b, max_b))
+        write_int(f"{base}/brightness", b)
     if "color" in kwargs:
         r, g, b = kwargs["color"]
+        # Clamp each channel to 0..255 — prevents garbage in sysfs
+        r, g, b = (max(0, min(255, int(v))) for v in (r, g, b))
         write_str(f"{base}/color", f"{r} {g} {b}")
     if "blink_type" in kwargs:
-        write_str(f"{base}/blink_type", kwargs["blink_type"])
+        # Only allow short ASCII strings (no shell metacharacters)
+        s = str(kwargs["blink_type"])[:64]
+        if all(c.isalnum() or c in " -_" for c in s):
+            write_str(f"{base}/blink_type", s)
     # Invalidate the LED cache so the next read reflects the change
     _cache.pop("leds", None)
     return True
@@ -940,16 +949,25 @@ def get_leds_config():
 
 
 def save_leds_config(content):
-    """Write /etc/ugreen-leds.conf with backup."""
+    """Write /etc/ugreen-leds.conf atomically: .tmp then os.replace()."""
     try:
         backup = LEDS_CONF_PATH + ".bak"
         if os.path.exists(LEDS_CONF_PATH):
             with open(LEDS_CONF_PATH) as src, open(backup, "w") as dst:
                 dst.write(src.read())
-        with open(LEDS_CONF_PATH, "w") as f:
+        tmp = LEDS_CONF_PATH + ".tmp"
+        with open(tmp, "w") as f:
             f.write(content)
+            f.flush()
+            os.fsync(f.fileno())  # ensure data is on disk before swap
+        os.replace(tmp, LEDS_CONF_PATH)  # atomic on POSIX
         return True
     except OSError:
+        # Best-effort cleanup of leftover .tmp
+        try:
+            os.remove(LEDS_CONF_PATH + ".tmp")
+        except OSError:
+            pass
         return False
 
 
@@ -1217,14 +1235,14 @@ class Handler(BaseHTTPRequestHandler):
             elif mode == "manual":
                 fan_mode = "manual"
                 stop_auto()
-                count = int(body.get("count", 0))
+                count = max(0, min(len(FAN_CDEVS), int(body.get("count", 0))))
                 fan_manual_count = set_fans(count)
                 self.send_json({"ok": True, "mode": "manual", "count": fan_manual_count})
             else:
                 self.send_json({"ok": False, "error": "invalid mode"}, 400)
 
         elif path == "/api/fan/set":
-            count = int(body.get("count", 0))
+            count = max(0, min(len(FAN_CDEVS), int(body.get("count", 0))))
             if fan_mode == "manual":
                 fan_manual_count = set_fans(count)
             else:
@@ -1297,6 +1315,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", len(html))
+        self.send_header("Cache-Control", "public, max-age=60")
         self.end_headers()
         self.wfile.write(html)
 
@@ -2378,7 +2397,8 @@ if __name__ == "__main__":
     # Start auto fan control
     start_auto()
     print(f"Starting DX4600 Pro Hardware Monitor on http://{HOST}:{PORT}")
-    server = HTTPServer((HOST, PORT), Handler)
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server.daemon_threads = True  # don't block shutdown on lingering requests
     try:
         server.serve_forever()
     except KeyboardInterrupt:
