@@ -27,7 +27,11 @@ _cache_ttl = {
     "services": 10,
     "health": 15,
     "dkms": 60,
+    "disk_serials": 60,
 }
+
+# Cap POST body to a reasonable size (largest legit endpoint is /api/config/leds).
+MAX_POST_BODY = 65536
 
 def cached(key, fn, *args):
     """Return cached result if within TTL, else recalculate."""
@@ -39,11 +43,68 @@ def cached(key, fn, *args):
     _cache[key] = {"ts": now, "data": data}
     return data
 
-# ─── Hardware paths ───
-HWMON_CORETEMP = "/sys/class/hwmon/hwmon2"
-HWMON_NVME = "/sys/class/hwmon/hwmon1"
-HWMON_ACPI = "/sys/class/hwmon/hwmon0"
-FAN_CDEVS = [f"/sys/class/thermal/cooling_device{i}" for i in range(4, 9)]
+# ─── Hardware discovery (robust to kernel/sysfs renumbering) ───
+def _discover_hwmon(name):
+    """Find the first hwmon device whose chip name matches `name`."""
+    try:
+        for hwmon in os.listdir("/sys/class/hwmon"):
+            try:
+                with open(f"/sys/class/hwmon/{hwmon}/name") as f:
+                    if f.read().strip() == name:
+                        return f"/sys/class/hwmon/{hwmon}"
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return None
+
+
+def _discover_fan_cdevs():
+    """Discover all cooling devices that are actual fans (type=Fan) AND have
+    a writable cur_state. Robust to kernel renumbering while skipping CPU
+    processor cooling zones and driver-managed zones like intel_powerclamp."""
+    cdevs = []
+    try:
+        for d in sorted(os.listdir("/sys/class/thermal")):
+            if not d.startswith("cooling_device"):
+                continue
+            path = f"/sys/class/thermal/{d}"
+            if not os.path.exists(f"{path}/cur_state"):
+                continue
+            try:
+                with open(f"{path}/type") as f:
+                    t = f.read().strip()
+            except OSError:
+                continue
+            if t == "Fan":
+                cdevs.append(path)
+    except OSError:
+        pass
+    if not cdevs:
+        # Fallback to historical DX4600 Pro layout if discovery finds nothing
+        cdevs = [f"/sys/class/thermal/cooling_device{i}" for i in range(4, 9)]
+    return cdevs
+
+
+def _discover_primary_netif():
+    """Find the primary LAN interface (skip lo, prefer en*/eth*)."""
+    try:
+        for d in sorted(os.listdir("/sys/class/net")):
+            if d == "lo":
+                continue
+            if d.startswith(("en", "eth")):
+                return d
+    except OSError:
+        pass
+    return "enp2s0"
+
+
+# Resolved at startup; fall back to historical defaults if discovery misses.
+HWMON_CORETEMP = _discover_hwmon("coretemp") or _discover_hwmon("k10temp") or "/sys/class/hwmon/hwmon2"
+HWMON_NVME = _discover_hwmon("nvme") or "/sys/class/hwmon/hwmon1"
+HWMON_ACPI = _discover_hwmon("acpi") or "/sys/class/hwmon/hwmon0"
+FAN_CDEVS = _discover_fan_cdevs()
+_PRIMARY_NETIF = _discover_primary_netif()
 LED_BASE = "/sys/class/leds"
 LED_NAMES = ["power", "netdev", "disk1", "disk2", "disk3", "disk4"]
 
@@ -53,8 +114,10 @@ LED_SERVICES = [
     ("ugreen-probe-leds",      "LED 硬件探测"),
     ("ugreen-power-led",       "电源 LED"),
     ("ugreen-diskiomon",       "磁盘 IO 监控"),
-    ("ugreen-netdevmon@enp2s0","网络 IO 监控"),
+    (f"ugreen-netdevmon@{_PRIMARY_NETIF}", "网络 IO 监控"),
 ]
+# Convenience: the netdev service unit (used by led_repair/dkms_rebuild)
+NETDEV_SERVICE = f"ugreen-netdevmon@{_PRIMARY_NETIF}"
 LEDS_CONF_PATH = "/etc/ugreen-leds.conf"
 DKMS_PKG_NAME = "led-ugreen"
 DKMS_PKG_VERSION = "0.3"
@@ -154,6 +217,7 @@ def set_fans(count):
     for i, cdev in enumerate(FAN_CDEVS):
         target = 1 if i < count else 0
         write_int(f"{cdev}/cur_state", target)
+    _cache.pop("fans", None)  # Invalidate so next poll sees the change
     return count
 
 
@@ -238,6 +302,8 @@ def set_led(name, **kwargs):
         write_str(f"{base}/color", f"{r} {g} {b}")
     if "blink_type" in kwargs:
         write_str(f"{base}/blink_type", kwargs["blink_type"])
+    # Invalidate the LED cache so the next read reflects the change
+    _cache.pop("leds", None)
     return True
 
 
@@ -491,6 +557,9 @@ def led_repair():
         result["ok"] = False
         result["message"] = "修复后仍未检测到 LED 设备，请尝试重启系统后再点一次修复。"
 
+    # Drop cached LED/service snapshots so the next UI poll reflects changes
+    _cache.pop("leds", None)
+    _cache.pop("services", None)
     return result
 
 
@@ -649,24 +718,39 @@ def get_disk_serials():
 
 # ─── Service status ───
 def get_service_statuses():
-    """Query systemd for LED-related service statuses — batched into one call."""
+    """Query systemd for LED-related service statuses — batched into one call.
+
+    Uses Key=Value parsing (without --value) so an empty SubState never
+    shifts the line index and breaks the alignment."""
     units = [svc if "." in svc else svc + ".service" for svc, _ in LED_SERVICES]
     results = []
     try:
         r = subprocess.run(
-            ["systemctl", "show", *units, 
-             "--property=Id,ActiveState,SubState", "--value"],
+            ["systemctl", "show", *units,
+             "--property=Id,ActiveState,SubState", "--no-pager"],
             capture_output=True, text=True, timeout=10
         )
-        lines = [l for l in r.stdout.split("\n") if l.strip()]
         statuses = {}
-        i = 0
-        while i + 2 < len(lines):
-            name = lines[i].strip()
-            active = lines[i+1].strip()
-            sub = lines[i+2].strip()
-            statuses[name] = (active, sub)
-            i += 3
+        current = {}
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                # Empty line marks unit boundary
+                if current.get("Id"):
+                    statuses[current["Id"]] = (
+                        current.get("ActiveState", "unknown"),
+                        current.get("SubState", "unknown"),
+                    )
+                    current = {}
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                current[k] = v
+        if current.get("Id"):
+            statuses[current["Id"]] = (
+                current.get("ActiveState", "unknown"),
+                current.get("SubState", "unknown"),
+            )
         for svc_name, label in LED_SERVICES:
             unit = svc_name if "." in svc_name else svc_name + ".service"
             active, sub = statuses.get(unit, ("unknown", "unknown"))
@@ -685,11 +769,14 @@ def get_service_statuses():
 
 # ─── Health check ───
 def get_health_check():
-    """Comprehensive health check for all system components."""
+    """Comprehensive health check for all system components.
+
+    Reuses the already-batched /cached `services` and `dkms` lookups so we
+    don't re-shell-out 6+ times per check."""
     issues = []
     ok_count = 0
     warn_count = 0
-    
+
     # 1. LED devices check
     led_list = [n for n in LED_NAMES if os.path.isdir(f"{LED_BASE}/{n}")]
     if not led_list:
@@ -708,75 +795,51 @@ def get_health_check():
                 "component": "LED 设备",
                 "message": f"部分 LED 不可用: {', '.join(missing)}"
             })
-    
-    # 2. Service health
-    for svc, label in LED_SERVICES:
-        unit = svc if "." in svc else svc + ".service"
-        try:
-            r = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True, timeout=5)
-            status = r.stdout.strip()
-            if status == "active":
-                ok_count += 1
-            elif status == "failed":
-                issues.append({
-                    "severity": "error",
-                    "component": label,
-                    "message": f"服务 {svc} 状态: {status}",
-                    "fix": f"systemctl restart {unit}"
-                })
-            elif status == "inactive":
-                issues.append({
-                    "severity": "warning",
-                    "component": label,
-                    "message": f"服务 {svc} 已停止",
-                    "fix": f"systemctl start {unit}"
-                })
-        except Exception:
+
+    # 2. Service health — reuse the batched cache (one systemctl show call)
+    services = cached("services", get_service_statuses)
+    kernel = os.uname().release
+    for svc in services:
+        st = svc["status"]
+        if st == "active":
+            ok_count += 1
+        elif st == "failed":
             issues.append({
                 "severity": "error",
-                "component": label,
-                "message": f"无法查询服务 {svc}"
+                "component": svc["label"],
+                "message": f"服务 {svc['name']} 状态: failed",
+                "fix": f"systemctl restart {svc['name']}.service"
             })
-    
-    # 3. DKMS module check
-    kernel = os.uname().release
-    dkms_ok = False
-    try:
-        r = subprocess.run(
-            ["dkms", "status", DKMS_PKG_NAME],
-            capture_output=True, text=True, timeout=5
-        )
-        if kernel in r.stdout and "installed" in r.stdout:
-            dkms_ok = True
-    except Exception:
-        pass
-    
-    if dkms_ok:
+        elif st == "inactive":
+            issues.append({
+                "severity": "warning",
+                "component": svc["label"],
+                "message": f"服务 {svc['name']} 已停止",
+                "fix": f"systemctl start {svc['name']}.service"
+            })
+        else:
+            issues.append({
+                "severity": "warning",
+                "component": svc["label"],
+                "message": f"服务 {svc['name']} 状态: {st}"
+            })
+
+    # 3. DKMS module check — reuse the cached dkms info
+    dkms = cached("dkms", get_dkms_info)
+    if dkms.get("module_loaded"):
         ok_count += 1
     else:
-        # Check if module is at least loaded
-        try:
-            r = subprocess.run(["lsmod"], capture_output=True, text=True, timeout=5)
-            if "led_ugreen" in r.stdout:
-                ok_count += 1
-            else:
-                issues.append({
-                    "severity": "error",
-                    "component": "内核模块",
-                    "message": f"led-ugreen 模块未加载 (内核 {kernel})",
-                    "fix": "重启系统或手动运行 deploy.sh"
-                })
-        except Exception:
-            issues.append({
-                "severity": "error",
-                "component": "内核模块",
-                "message": "无法检测内核模块状态"
-            })
-    
-    # 4. I2C bus check
+        issues.append({
+            "severity": "error",
+            "component": "内核模块",
+            "message": f"led-ugreen 模块未加载 (内核 {kernel})",
+            "fix": "点击 🔧 修复 自动重新构建并加载"
+        })
+
+    # 4. I2C bus check — only scan when LEDs are missing (otherwise skip)
     if not led_list:
         try:
-            import re
+            import re as _re
             i2c_devs = sorted(os.listdir("/sys/bus/i2c/devices"))
             found = False
             for dev in i2c_devs:
@@ -787,10 +850,18 @@ def get_health_check():
                     name = open(f"/sys/bus/i2c/devices/{dev}/name").read().strip()
                 except Exception:
                     name = ""
-                if "gmbus" in name.lower():
+                # Skip GPU/SoC buses — never the LED controller
+                low = name.lower()
+                if any(k in low for k in ("gmbus", "drm", "designware", "synopsys")):
                     continue
+                # Locate i2cdetect (install path varies across fnOS images)
+                ic = next((c for c in ("/usr/local/bin/i2cdetect",
+                                       "/usr/sbin/i2cdetect",
+                                       "/usr/bin/i2cdetect") if os.path.exists(c)), None)
+                if not ic:
+                    break
                 r = subprocess.run(
-                    ["/usr/local/bin/i2cdetect", "-y", "-r", bus, "0x3a", "0x3a"],
+                    [ic, "-y", "-r", bus, "0x3a", "0x3a"],
                     capture_output=True, text=True, timeout=5
                 )
                 if "3a" in r.stdout:
@@ -814,10 +885,11 @@ def get_health_check():
                 "component": "I2C 扫描",
                 "message": f"I2C 扫描异常: {e}"
             })
-    
+
     # 5. Disk detection
     try:
-        r = subprocess.run(["lsblk", "-S", "-o", "name,tran", "-n"], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(["lsblk", "-S", "-o", "name,tran", "-n"],
+                           capture_output=True, text=True, timeout=5)
         sata_disks = [l.split()[0] for l in r.stdout.strip().split("\n") if "sata" in l]
         if not sata_disks:
             issues.append({
@@ -829,34 +901,8 @@ def get_health_check():
             ok_count += 1
     except Exception:
         pass
-    
-    # 6. Network interface
-    netdev_ok = False
-    try:
-        r = subprocess.run(["systemctl", "is-active", "ugreen-netdevmon@enp2s0"], capture_output=True, text=True, timeout=5)
-        if r.stdout.strip() == "active":
-            netdev_ok = True
-            ok_count += 1
-    except Exception:
-        pass
-    
-    if not netdev_ok:
-        # Try to find alternative
-        try:
-            import glob
-            ifaces = [os.path.basename(d) for d in glob.glob("/sys/class/net/en*") if d]
-            if ifaces:
-                issues.append({
-                    "severity": "warning",
-                    "component": "网络监控",
-                    "message": f"netdevmon 未运行，可用接口: {', '.join(ifaces[:3])}"
-                })
-        except Exception:
-            pass
-    
-    # Summary
+
     all_ok = len([i for i in issues if i["severity"] == "error"]) == 0
-    
     return {
         "ok": all_ok,
         "ok_count": ok_count,
@@ -864,7 +910,7 @@ def get_health_check():
         "issues": issues,
         "kernel": kernel,
         "led_devices": led_list,
-        "dkms_ok": dkms_ok,
+        "dkms_ok": dkms.get("module_loaded", False),
     }
 
 
@@ -951,7 +997,7 @@ def dkms_rebuild():
     # critical=True means failure aborts the whole sequence
     steps = [
         ("停止 LED 监控服务",
-         "systemctl stop ugreen-diskiomon ugreen-netdevmon@enp2s0 ugreen-power-led 2>&1",
+         f"systemctl stop ugreen-diskiomon {NETDEV_SERVICE} ugreen-power-led 2>&1",
          False),
         ("卸载 I2C 设备",
          f"sh -c 'echo 0x3a > /sys/bus/i2c/devices/i2c-{bus}/delete_device 2>/dev/null; true'",
@@ -978,7 +1024,7 @@ def dkms_rebuild():
          f"sh -c 'sleep 0.5 && echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-{bus}/new_device 2>&1'",
          True),
         ("重启 LED 服务",
-         "systemctl restart ugreen-led-init ugreen-probe-leds ugreen-power-led ugreen-diskiomon ugreen-netdevmon@enp2s0 2>&1",
+         f"systemctl restart ugreen-led-init ugreen-probe-leds ugreen-power-led ugreen-diskiomon {NETDEV_SERVICE} 2>&1",
          False),
     ]
     log_lines = []
@@ -1072,6 +1118,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        try:
+            self._do_GET()
+        except Exception as e:
+            self.send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+
+    def _do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
@@ -1099,8 +1151,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/dkms":
             self.send_json(cached("dkms", get_dkms_info))
         elif path == "/api/disk-serials":
-            self.send_json(get_disk_serials())
+            self.send_json(cached("disk_serials", get_disk_serials))
         elif path == "/api/realtime":
+            # temps + fans + LEDs in one shot so the 3s refresh keeps the
+            # LED card in sync with state changes
             self.send_json({
                 "temps": cached("temps", get_temps),
                 "fans": {
@@ -1108,6 +1162,7 @@ class Handler(BaseHTTPRequestHandler):
                     "manual_count": fan_manual_count,
                     "fans": cached("fans", get_fan_status),
                 },
+                "leds": cached("leds", get_led_status),
             })
         elif path == "/api/status":
             self.send_json({
@@ -1133,11 +1188,24 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        try:
+            self._do_POST()
+        except Exception as e:
+            self.send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+
+    def _do_POST(self):
         global fan_mode, fan_manual_count
         parsed = urlparse(self.path)
         path = parsed.path
 
-        length = int(self.headers.get("Content-Length", 0))
+        # Cap body size to prevent a malicious client from exhausting memory
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        if length < 0 or length > MAX_POST_BODY:
+            self.send_json({"ok": False, "error": "body too large"}, 413)
+            return
         body = json.loads(self.rfile.read(length)) if length else {}
 
         if path == "/api/fan/mode":
@@ -2037,6 +2105,7 @@ async function refresh() {
     const data = await api('GET', '/api/realtime');
     renderTemps(data.temps);
     renderFans(data.fans);
+    if (!colorPickerOpen && data.leds) renderLeds(data.leds);
     document.getElementById('last-update').textContent = '最后更新: ' + new Date().toLocaleTimeString('zh-CN');
     if (firstLoad) {
       firstLoad = false;
