@@ -69,7 +69,9 @@ modprobe led-ugreen
 **3. 创建 I2C 设备**
 
 ```bash
-echo "led-ugreen 0x3a" > /sys/bus/i2c/devices/i2c-0/new_device
+# 通过自动检测脚本定位总线，避免内核升级后总线号变化导致失败
+BUS=$(/usr/bin/ugreen-detect-i2c)
+echo "led-ugreen 0x3a" > /sys/bus/i2c/devices/i2c-${BUS}/new_device
 ```
 
 验证 LED 设备出现：`ls /sys/class/leds/` 应看到 power, netdev, disk1-4。
@@ -127,7 +129,8 @@ apt-get install -y linux-headers-$(uname -r)
 dkms build led-ugreen/0.3 -k $(uname -r)
 dkms install led-ugreen/0.3 -k $(uname -r) --force
 modprobe led-ugreen
-echo "led-ugreen 0x3a" > /sys/bus/i2c/devices/i2c-0/new_device
+BUS=$(/usr/bin/ugreen-detect-i2c)
+echo "led-ugreen 0x3a" > /sys/bus/i2c/devices/i2c-${BUS}/new_device
 systemctl restart ugreen-led-init ugreen-probe-leds ugreen-power-led ugreen-diskiomon ugreen-netdevmon@enp2s0
 ```
 

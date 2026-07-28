@@ -1,11 +1,47 @@
 #!/bin/bash
-# Auto-detect I2C bus for UGREEN LED controller
-SLAVE_ADDR=0x3a
+# Auto-detect I2C bus for UGREEN LED controller (slave 0x3a)
+# Robust against fnOS kernel upgrades that renumber I2C buses, and against the
+# controller being visible on multiple adapters (DesignWare + SMBus I801).
+SLAVE_ADDR=3a
+
+# Fast path: an existing device node. Prefer the SMBus I801 adapter, which is
+# the bus that actually drives the LED class devices on fnOS.
+best=""
+for d in /sys/bus/i2c/devices/*-003a; do
+    [ -e "$d" ] || continue
+    b="${d##*/}"; b="${b%-003a}"; b="${b#i2c-}"
+    bn=$(cat "/sys/bus/i2c/devices/i2c-${b}/name" 2>/dev/null || echo x)
+    if echo "$bn" | grep -qi "SMBus I801"; then
+        echo "$b"; exit 0
+    fi
+    [ -z "$best" ] && best="$b"
+done
+[ -n "$best" ] && { echo "$best"; exit 0; }
+
+# Locate i2cdetect (install path has varied across fnOS images)
+I2CDETECT=""
+for c in /usr/local/bin/i2cdetect /usr/sbin/i2cdetect /usr/bin/i2cdetect; do
+    [ -x "$c" ] && I2CDETECT="$c" && break
+done
+[ -z "$I2CDETECT" ] && exit 1
+
+# Scan every I2C bus. Prefer SMBus I801; fall back to any non-GPU bus.
+preferred=""
+fallback=""
 for p in /sys/bus/i2c/devices/i2c-*; do
     b="${p##*/i2c-}"
     n=$(cat "$p/name" 2>/dev/null || echo x)
+    # Skip GPU / display buses - never the LED controller
     case $n in *gmbus*|*drm*|*DP*|*HDMI*|*DDC*) continue ;; esac
-    r=$(/usr/local/bin/i2cdetect -y "$b" "$SLAVE_ADDR" "$SLAVE_ADDR" 2>/dev/null) || true
-    [ -n "$r" ] && echo "$r" | grep -q UU && { echo "$b"; exit 0; }
+    r=$("$I2CDETECT" -y -r "$b" "$SLAVE_ADDR" "$SLAVE_ADDR" 2>/dev/null) || true
+    if echo "$r" | grep -qiE "($SLAVE_ADDR|UU)"; then
+        if echo "$n" | grep -qi "SMBus I801"; then
+            preferred="$b"
+        elif [ -z "$fallback" ]; then
+            fallback="$b"
+        fi
+    fi
 done
+[ -n "$preferred" ] && { echo "$preferred"; exit 0; }
+[ -n "$fallback" ] && { echo "$fallback"; exit 0; }
 exit 1

@@ -5,7 +5,7 @@ After=local-fs.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'BUS=$(/usr/bin/ugreen-detect-i2c); modprobe led-ugreen 2>/dev/null; sleep 0.5; echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-${BUS}/new_device 2>/dev/null; true'
+ExecStart=/bin/sh -c 'K=$(uname -r); if ! /usr/sbin/modprobe -n led-ugreen >/dev/null 2>&1; then /usr/sbin/dkms add led-ugreen/0.3 >/dev/null 2>&1 || true; /usr/sbin/dkms install led-ugreen/0.3 -k "$K" >/dev/null 2>&1 || true; fi; BUS=$(/usr/bin/ugreen-detect-i2c); if [ -z "$BUS" ]; then echo "LED controller not found on any I2C bus" >&2; exit 1; fi; /usr/sbin/modprobe led-ugreen 2>/dev/null || true; sleep 0.5; echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-${BUS}/new_device 2>/dev/null || true; true'
 ExecStop=-/usr/sbin/modprobe -r led-ugreen
 
 [Install]
