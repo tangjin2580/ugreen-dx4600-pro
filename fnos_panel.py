@@ -7,6 +7,7 @@ Zero external dependencies — uses Python stdlib only.
 
 import json
 import os
+import gzip
 import glob
 import time
 import threading
@@ -97,6 +98,22 @@ def _discover_primary_netif():
     except OSError:
         pass
     return "enp2s0"
+
+
+# Cached at startup; resolved lazily on first call to avoid slowing import.
+_I2CDETECT_PATH = None
+
+
+def _get_i2cdetect():
+    """Locate the i2cdetect binary, memoizing the result."""
+    global _I2CDETECT_PATH
+    if _I2CDETECT_PATH is not None:
+        return _I2CDETECT_PATH
+    for c in ("/usr/local/bin/i2cdetect", "/usr/sbin/i2cdetect", "/usr/bin/i2cdetect"):
+        if os.path.exists(c):
+            _I2CDETECT_PATH = c
+            return _I2CDETECT_PATH
+    return None
 
 
 # Resolved at startup; fall back to historical defaults if discovery misses.
@@ -212,13 +229,22 @@ def get_fan_status():
 
 
 def set_fans(count):
-    """Turn on `count` fans (0-5)."""
-    count = max(0, min(5, count))
+    """Turn on `count` fans (0..len(FAN_CDEVS)). Skip sysfs writes if the state
+    hasn't changed — auto_loop calls this every 3s and idle writes are pure noise."""
+    global _last_fan_state
+    count = max(0, min(len(FAN_CDEVS), count))
+    new_state = tuple(1 if i < count else 0 for i in range(len(FAN_CDEVS)))
+    if new_state == _last_fan_state:
+        return count
+    _last_fan_state = new_state
     for i, cdev in enumerate(FAN_CDEVS):
-        target = 1 if i < count else 0
-        write_int(f"{cdev}/cur_state", target)
+        write_int(f"{cdev}/cur_state", new_state[i])
     _cache.pop("fans", None)  # Invalidate so next poll sees the change
     return count
+
+
+# Last fan state we wrote to sysfs; used to skip redundant writes
+_last_fan_state = None
 
 
 def get_cpu_package_temp():
@@ -474,11 +500,7 @@ def detect_led_bus():
         devs = sorted(os.listdir("/sys/bus/i2c/devices"))
     except OSError:
         return None
-    i2cdetect = None
-    for c in ("/usr/local/bin/i2cdetect", "/usr/sbin/i2cdetect", "/usr/bin/i2cdetect"):
-        if os.path.exists(c):
-            i2cdetect = c
-            break
+    i2cdetect = _get_i2cdetect()
     if i2cdetect is None:
         return None
     preferred = None
@@ -848,7 +870,6 @@ def get_health_check():
     # 4. I2C bus check — only scan when LEDs are missing (otherwise skip)
     if not led_list:
         try:
-            import re as _re
             i2c_devs = sorted(os.listdir("/sys/bus/i2c/devices"))
             found = False
             for dev in i2c_devs:
@@ -863,10 +884,7 @@ def get_health_check():
                 low = name.lower()
                 if any(k in low for k in ("gmbus", "drm", "designware", "synopsys")):
                     continue
-                # Locate i2cdetect (install path varies across fnOS images)
-                ic = next((c for c in ("/usr/local/bin/i2cdetect",
-                                       "/usr/sbin/i2cdetect",
-                                       "/usr/bin/i2cdetect") if os.path.exists(c)), None)
+                ic = _get_i2cdetect()
                 if not ic:
                     break
                 r = subprocess.run(
@@ -1127,13 +1145,26 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # suppress default logging
 
+    def _gzip_ok(self):
+        return "gzip" in self.headers.get("Accept-Encoding", "").lower()
+
     def send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", len(body))
-        self.end_headers()
-        self.wfile.write(body)
+        if self._gzip_ok() and len(body) > 512:
+            body = gzip.compress(body)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
 
     def do_GET(self):
         try:
@@ -1312,12 +1343,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_html(self):
         html = INDEX_HTML.encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", len(html))
-        self.send_header("Cache-Control", "public, max-age=60")
-        self.end_headers()
-        self.wfile.write(html)
+        if self._gzip_ok():
+            html = gzip.compress(html)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
+            self.send_header("Content-Length", len(html))
+            self.send_header("Cache-Control", "public, max-age=60")
+            self.end_headers()
+            self.wfile.write(html)
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", len(html))
+            self.send_header("Cache-Control", "public, max-age=60")
+            self.end_headers()
+            self.wfile.write(html)
 
 
 # ─── HTML Page ───
@@ -2120,6 +2162,9 @@ async function api(method, path, body) {
 
 let firstLoad = true;
 async function refresh() {
+  // Skip polling entirely when the tab is hidden — saves CPU/network when
+  // the user isn't looking. Browser-throttled but still wasted on a NAS.
+  if (document.hidden) return;
   try {
     const data = await api('GET', '/api/realtime');
     renderTemps(data.temps);
@@ -2137,6 +2182,7 @@ async function refresh() {
 }
 
 async function refreshAll() {
+  if (document.hidden) return;
   try {
     const data = await api('GET', '/api/all');
     if (!colorPickerOpen) renderLeds(data.leds);
@@ -2145,6 +2191,11 @@ async function refreshAll() {
     updateHealth(data.health);
   } catch(e) { console.log('Status refresh error:', e); }
 }
+
+// Catch up immediately when the tab becomes visible again
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { refresh(); refreshAll(); }
+});
 
 // ─── Fan controls ───
 async function setFanMode(mode) {
