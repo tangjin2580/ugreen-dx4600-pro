@@ -487,12 +487,14 @@ Type=oneshot
 RemainAfterExit=yes
 # 异常断电冷重启时，SMBus I801 适配器(i2c 总线)尚未被内核/udev 枚举，
 # 原逻辑会立即因找不到 0x3a 而退出，导致 LED 设备节点未创建、灯不亮。
-# 这里改为轮询等待总线就绪(最多 ~30s)，并加 Restart 兜底应对极慢的磁盘检查。
+# 修复:
+#  1) 轮询等待 SMBus I801 总线就绪(最多 ~30s)，解决开机竞态；
+#  2) 若 LED 设备节点已存在(热重启/fnOS 已加载)则直接跳过，避免拆掉正常工作的灯；
+#  3) Restart=on-failure + TimeoutStartSec=120 兜底极慢的磁盘检查/枚举。
 TimeoutStartSec=120
 Restart=on-failure
 RestartSec=5
-ExecStart=/bin/sh -c 'K=$(uname -r); if ! /usr/sbin/modprobe -n led-ugreen >/dev/null 2>&1; then /usr/sbin/dkms add led-ugreen/0.3 >/dev/null 2>&1 || true; /usr/sbin/dkms install led-ugreen/0.3 -k "$K" >/dev/null 2>&1 || true; fi; BUS=""; for i in $(seq 1 60); do for p in /sys/bus/i2c/devices/i2c-*; do n=$(cat "$p/name" 2>/dev/null || true); if echo "$n" | grep -qi "SMBus I801"; then BUS="${p##*/i2c-}"; break 2; fi; done; sleep 0.5; done; if [ -z "$BUS" ]; then BUS=$(/usr/bin/ugreen-detect-i2c 2>/dev/null); fi; if [ -z "$BUS" ]; then echo "LED controller not found on any I2C bus" >&2; exit 1; fi; /usr/sbin/modprobe led-ugreen 2>/dev/null || true; sleep 0.5; echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-${BUS}/new_device 2>/dev/null || true; true'
-ExecStop=-/usr/sbin/modprobe -r led-ugreen
+ExecStart=/bin/sh -c 'K=$(uname -r); if ! /usr/sbin/modprobe -n led-ugreen >/dev/null 2>&1; then /usr/sbin/dkms add led-ugreen/0.3 >/dev/null 2>&1 || true; /usr/sbin/dkms install led-ugreen/0.3 -k "$K" >/dev/null 2>&1 || true; fi; for d in /sys/bus/i2c/devices/*-003a; do [ -e "$d" ] && exit 0; done; BUS=""; for i in $(seq 1 60); do for p in /sys/bus/i2c/devices/i2c-*; do n=$(cat "$p/name" 2>/dev/null || true); if echo "$n" | grep -qi "SMBus I801"; then BUS="${p##*/i2c-}"; break 2; fi; done; sleep 0.5; done; if [ -z "$BUS" ]; then BUS=$(/usr/bin/ugreen-detect-i2c 2>/dev/null); fi; if [ -z "$BUS" ]; then echo "LED controller not found on any I2C bus" >&2; exit 1; fi; /usr/sbin/modprobe led-ugreen 2>/dev/null || true; sleep 0.5; echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-${BUS}/new_device 2>/dev/null || true; true'
 
 [Install]
 WantedBy=multi-user.target
