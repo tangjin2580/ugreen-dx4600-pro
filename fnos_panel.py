@@ -494,7 +494,7 @@ RemainAfterExit=yes
 TimeoutStartSec=120
 Restart=on-failure
 RestartSec=5
-ExecStart=/bin/sh -c 'K=$(uname -r); if ! /usr/sbin/modprobe -n led-ugreen >/dev/null 2>&1; then /usr/sbin/dkms add led-ugreen/0.3 >/dev/null 2>&1 || true; /usr/sbin/dkms install led-ugreen/0.3 -k "$K" >/dev/null 2>&1 || true; fi; for l in power disk1 netdev; do [ -e /sys/class/leds/$l ] && exit 0; done; BUS=""; for i in $(seq 1 60); do for p in /sys/bus/i2c/devices/i2c-*; do n=$(cat "$p/name" 2>/dev/null || true); if echo "$n" | grep -qi "SMBus I801"; then BUS="${p##*/i2c-}"; break 2; fi; done; sleep 0.5; done; if [ -z "$BUS" ]; then BUS=$(/usr/bin/ugreen-detect-i2c 2>/dev/null); fi; if [ -z "$BUS" ]; then echo "LED controller not found on any I2C bus" >&2; exit 1; fi; /usr/sbin/modprobe led-ugreen 2>/dev/null || true; sleep 0.5; echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-${BUS}/new_device 2>/dev/null || true; true'
+ExecStart=/bin/sh -c 'K=$(uname -r); if ! /usr/sbin/modprobe -n led-ugreen >/dev/null 2>&1; then /usr/sbin/dkms add led-ugreen/0.3 >/dev/null 2>&1 || true; /usr/sbin/dkms install led-ugreen/0.3 -k "$K" >/dev/null 2>&1 || true; fi; for l in power disk1 netdev; do [ -e /sys/class/leds/$l ] && exit 0; done; BUS=""; for i in $(seq 1 60); do BUS=$(/usr/bin/ugreen-detect-i2c 2>/dev/null); [ -n "$BUS" ] && break; sleep 0.5; done; if [ -z "$BUS" ]; then echo "LED controller not found on any I2C bus" >&2; exit 1; fi; /usr/sbin/modprobe led-ugreen 2>/dev/null || true; sleep 0.5; echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-${BUS}/new_device 2>/dev/null || true; true'
 
 [Install]
 WantedBy=multi-user.target
