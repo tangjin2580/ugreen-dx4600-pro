@@ -6,6 +6,10 @@ Requires=ugreen-probe-leds.service
 [Service]
 ExecStart=/usr/bin/ugreen-diskiomon
 StandardOutput=journal
+# diskiomon 是常驻守护进程: 一旦崩溃(非零退出)自动拉起, 避免磁盘灯卡在旧状态。
+# 正常停止(systemctl stop 发 SIGTERM)与"无盘早退(exit 0)"不触发重启。
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
