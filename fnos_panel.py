@@ -479,12 +479,19 @@ echo led-ugreen 0x3a > "/sys/bus/i2c/devices/i2c-${I2C}/new_device"
 # /etc/systemd/system/ugreen-led-init.service.
 UGREEN_LED_INIT_SERVICE = r'''[Unit]
 Description=Load UGREEN LED driver and create I2C device
-After=local-fs.target
+After=local-fs.target systemd-modules-load.service
+Wants=systemd-modules-load.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'K=$(uname -r); if ! /usr/sbin/modprobe -n led-ugreen >/dev/null 2>&1; then /usr/sbin/dkms add led-ugreen/0.3 >/dev/null 2>&1 || true; /usr/sbin/dkms install led-ugreen/0.3 -k "$K" >/dev/null 2>&1 || true; fi; BUS=$(/usr/bin/ugreen-detect-i2c); if [ -z "$BUS" ]; then echo "LED controller not found on any I2C bus" >&2; exit 1; fi; /usr/sbin/modprobe led-ugreen 2>/dev/null || true; sleep 0.5; echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-${BUS}/new_device 2>/dev/null || true; true'
+# 异常断电冷重启时，SMBus I801 适配器(i2c 总线)尚未被内核/udev 枚举，
+# 原逻辑会立即因找不到 0x3a 而退出，导致 LED 设备节点未创建、灯不亮。
+# 这里改为轮询等待总线就绪(最多 ~30s)，并加 Restart 兜底应对极慢的磁盘检查。
+TimeoutStartSec=120
+Restart=on-failure
+RestartSec=5
+ExecStart=/bin/sh -c 'K=$(uname -r); if ! /usr/sbin/modprobe -n led-ugreen >/dev/null 2>&1; then /usr/sbin/dkms add led-ugreen/0.3 >/dev/null 2>&1 || true; /usr/sbin/dkms install led-ugreen/0.3 -k "$K" >/dev/null 2>&1 || true; fi; BUS=""; for i in $(seq 1 60); do for p in /sys/bus/i2c/devices/i2c-*; do n=$(cat "$p/name" 2>/dev/null || true); if echo "$n" | grep -qi "SMBus I801"; then BUS="${p##*/i2c-}"; break 2; fi; done; sleep 0.5; done; if [ -z "$BUS" ]; then BUS=$(/usr/bin/ugreen-detect-i2c 2>/dev/null); fi; if [ -z "$BUS" ]; then echo "LED controller not found on any I2C bus" >&2; exit 1; fi; /usr/sbin/modprobe led-ugreen 2>/dev/null || true; sleep 0.5; echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-${BUS}/new_device 2>/dev/null || true; true'
 ExecStop=-/usr/sbin/modprobe -r led-ugreen
 
 [Install]
