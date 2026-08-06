@@ -15,10 +15,13 @@ RemainAfterExit=yes
 #  3) Restart=on-failure + TimeoutStartSec=120 兜底极慢的磁盘检查/枚举。
 # 注意: 总线号直接由已验证的 ugreen-detect-i2c 返回，避免在 unit 文件里做
 #        ${p##*/i2c-} 这类参数展开(systemd 解析器会把它弄丢)。
+# 轮询必须用 while 循环(而非 for i in $(seq 1 60); do ... break; done)：
+# 后者在 systemd ExecStart 解析/执行下，会把 BUS 在末尾 echo 处吞成空串，
+# 导致 "i2c-/new_device" 报错、LED 不亮。while 循环已实测无此问题。
 TimeoutStartSec=120
 Restart=on-failure
 RestartSec=5
-ExecStart=/bin/sh -c 'K=$(uname -r); if ! /usr/sbin/modprobe -n led-ugreen >/dev/null 2>&1; then /usr/sbin/dkms add led-ugreen/0.3 >/dev/null 2>&1 || true; /usr/sbin/dkms install led-ugreen/0.3 -k "$K" >/dev/null 2>&1 || true; fi; for l in power disk1 netdev; do [ -e /sys/class/leds/$l ] && exit 0; done; BUS=""; for i in $(seq 1 60); do BUS=$(/usr/bin/ugreen-detect-i2c 2>/dev/null); [ -n "$BUS" ] && break; sleep 0.5; done; if [ -z "$BUS" ]; then echo "LED controller not found on any I2C bus" >&2; exit 1; fi; /usr/sbin/modprobe led-ugreen 2>/dev/null || true; sleep 0.5; echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-${BUS}/new_device 2>/dev/null || true; true'
+ExecStart=/bin/sh -c 'K=$(uname -r); if ! /usr/sbin/modprobe -n led-ugreen >/dev/null 2>&1; then /usr/sbin/dkms add led-ugreen/0.3 >/dev/null 2>&1 || true; /usr/sbin/dkms install led-ugreen/0.3 -k "$K" >/dev/null 2>&1 || true; fi; for l in power disk1 netdev; do [ -e /sys/class/leds/$l ] && exit 0; done; BUS=""; n=0; while [ "$n" -lt 60 ]; do BUS=$(/usr/bin/ugreen-detect-i2c 2>/dev/null); if [ -n "$BUS" ]; then break; fi; sleep 0.5; n=$((n+1)); done; if [ -z "$BUS" ]; then echo "LED controller not found on any I2C bus" >&2; exit 1; fi; /usr/sbin/modprobe led-ugreen 2>/dev/null || true; sleep 0.5; echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-${BUS}/new_device 2>/dev/null || true; true'
 
 [Install]
 WantedBy=multi-user.target

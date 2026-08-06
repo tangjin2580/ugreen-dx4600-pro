@@ -491,10 +491,13 @@ RemainAfterExit=yes
 #  1) 轮询等待 SMBus I801 总线就绪(最多 ~30s)，解决开机竞态；
 #  2) 若 LED 设备节点已存在(热重启/fnOS 已加载)则直接跳过，避免拆掉正常工作的灯；
 #  3) Restart=on-failure + TimeoutStartSec=120 兜底极慢的磁盘检查/枚举。
+#  4) 轮询必须用 while 循环(而非 for i in $(seq 1 60); do ... break; done)：
+#     后者在 systemd ExecStart 解析/执行下会把 BUS 在末尾 echo 处吞成空串，
+#     导致 "i2c-/new_device" 报错、LED 不亮。while 循环已实测无此问题。
 TimeoutStartSec=120
 Restart=on-failure
 RestartSec=5
-ExecStart=/bin/sh -c 'K=$(uname -r); if ! /usr/sbin/modprobe -n led-ugreen >/dev/null 2>&1; then /usr/sbin/dkms add led-ugreen/0.3 >/dev/null 2>&1 || true; /usr/sbin/dkms install led-ugreen/0.3 -k "$K" >/dev/null 2>&1 || true; fi; for l in power disk1 netdev; do [ -e /sys/class/leds/$l ] && exit 0; done; BUS=""; for i in $(seq 1 60); do BUS=$(/usr/bin/ugreen-detect-i2c 2>/dev/null); [ -n "$BUS" ] && break; sleep 0.5; done; if [ -z "$BUS" ]; then echo "LED controller not found on any I2C bus" >&2; exit 1; fi; /usr/sbin/modprobe led-ugreen 2>/dev/null || true; sleep 0.5; echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-${BUS}/new_device 2>/dev/null || true; true'
+ExecStart=/bin/sh -c 'K=$(uname -r); if ! /usr/sbin/modprobe -n led-ugreen >/dev/null 2>&1; then /usr/sbin/dkms add led-ugreen/0.3 >/dev/null 2>&1 || true; /usr/sbin/dkms install led-ugreen/0.3 -k "$K" >/dev/null 2>&1 || true; fi; for l in power disk1 netdev; do [ -e /sys/class/leds/$l ] && exit 0; done; BUS=""; n=0; while [ "$n" -lt 60 ]; do BUS=$(/usr/bin/ugreen-detect-i2c 2>/dev/null); if [ -n "$BUS" ]; then break; fi; sleep 0.5; n=$((n+1)); done; if [ -z "$BUS" ]; then echo "LED controller not found on any I2C bus" >&2; exit 1; fi; /usr/sbin/modprobe led-ugreen 2>/dev/null || true; sleep 0.5; echo led-ugreen 0x3a > /sys/bus/i2c/devices/i2c-${BUS}/new_device 2>/dev/null || true; true'
 
 [Install]
 WantedBy=multi-user.target
